@@ -3,8 +3,8 @@
 ## RE Notes
 
 These docs were written based on extensive disassembly of the SPTM binary as
-found on the MacBook Neo (T8140) on firmware version 26.6 beta 4.  Parts are
-also taken from the corresponding KDK.
+found on the MacBook Neo (T8140) on firmware version 26.6 beta 4, as well
+as the 26.5 KDK.
 
 ## Scope
 
@@ -27,7 +27,7 @@ Every component of the SPTM emulator has two parts:
 
 Together, the completed documents cover the T8140 SPTM tables needed by the
 current macOS 26.6 beta 4 boot path. Start with the XNU bootstrap document,
-then use the device-specific documents for each runtime dispatch table.
+then use the subsystem-specific documents for each runtime dispatch table.
 
 ## Emulators
 
@@ -84,9 +84,9 @@ Dispatch flow: on every HVC trap the EL2 handler:
 | 6 | DOMAINS_NONE (sentinel) |
 | 255 | NO_PANICKING_DOMAIN |
 
-Only domain 0 (SPTM) and domain 2 (TXM) are brought up; domain 3 (SK) is not
-since we currently do not support exclaves. Domains 1 (XNU), 4 (XNU_HIB), 
-6 (DOMAINS_NONE), and 255 (NO_PANICKING_DOMAIN) are unused.
+Only domain 0 (SPTM) and domain 2 (TXM) are brought up in our emulator; domain
+3 (SK) is not since we currently do not support exclaves. Domains 1 (XNU), 4
+(XNU_HIB), 6 (DOMAINS_NONE), and 255 (NO_PANICKING_DOMAIN) are unused.
 
 ### Tables
 
@@ -104,7 +104,7 @@ owns these:
 | 6 | NVME | see [nvme.md](nvme.md) |
 | 7 | UAT | see [uat.md](uat.md) |
 | 8 | SHART | unused |
-| 9 | CPUTRACE | acked inline (endpoints 0..12), not otherwise emulated |
+| 9 | RESERVED | unused |
 | 10 | HIB | unused |
 | 11 | GEN3_DART_XNU | not present on T8140 |
 | 12 | GEN3_DART_SK | not present on T8140 |

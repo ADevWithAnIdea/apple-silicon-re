@@ -35,10 +35,10 @@ Two leaf attribute presets:
 
 | preset | leaf bits | meaning |
 |--------|-----------|---------|
-| code | `0x603` | AttrIndx 0, kernel-RW, executable |
-| data | `0x60000000000703` | same, but execute-never (PXN+UXN) |
+| code | `0x603` | AttrIndx 0, kernel-RW, executable, Outer Shareable |
+| data | `0x60000000000703` | AttrIndx 0, kernel-RW, execute-never (PXN+UXN), Inner Shareable |
 
-Only the kernelcache image is mapped as code, everything else as data.  We map
+Only the kernelcache image is mapped as code, everything else as data. We map
 the kernel RWX out of convenience. Real SPTM would never permit this mapping.
 
 **TTBR1 windows** (placement VAs are our choice except where noted):
@@ -48,20 +48,44 @@ the kernel RWX out of convenience. Real SPTM would never permit this mapping.
 | kernelcache image | kc VA range (real vmin..vmax) --> kc PA | code |
 | aux carveout | handoff scratch (structs, page-table pool, CPU/TXM stacks) | data |
 | iBoot boot args | the `boot_args` page (1.4 `x1`) | data |
-| device tree (ADT) | the ADT blob, just below the kernelcache VA | data |
+| device tree (ADT) | the ADT blob and TrustCache, just below the kernelcache VA | data |
 | physmap | the kernel's linear VA window over SPTM-managed RAM; bounds must match physmap base/end in 1.2 (rel 0x28/0x30) | data |
 | UAT L2 | GPU shared-region L2 page table; PA from the ADT `/arm-io/sgx` `gfx-shared-l2-region`; see uat.md | data |
 
-We also pre-allocate empty L3 tables over a dynamic region above the physmap
-and a high top range, so XNU can fill those leaves later without allocating
-tables.
+XNU expects empty L3 tables to be present for two additional TTBR1 ranges.  For
+every 32 MiB region intersecting either range, allocate a zero-filled L3 table
+and install it in the corresponding L2 entry. Create the required L2 table if
+it does not already exist.
+
+The first range begins at the first 32 MiB boundary at or above the end of the
+physmap. Its requested size is:
+
+```text
+memory_segments = ceil(mem_size / 256 MiB)
+
+dynamic_size = round_up(
+    2 MiB
+    + round_up(Video.height * Video.rowBytes, 16 KiB)
+    + 10 MiB * memory_segments,
+    8 MiB)
+```
+
+XNU uses these tables for allocations made while bootstrapping the VM system,
+before normal page-table allocation is operational.
+
+Our emulator uses a fixed 64 MiB framebuffer allowance instead of calculating
+`Video.height * Video.rowBytes`. Otherwise, it constructs the same empty table
+coverage.
+
+The second range is a single L3 table for the 32 MiB region immediately below
+the exclusive upper bound of XNU's kernel VA range. On the current target this
+covers `[0xfffffecffe000000, 0xfffffed000000000)`. XNU uses part of this VA
+range for its per-CPU copy windows and early-debug data.
 
 The TTBR1 root PA goes in the nested `libsptm` struct at (rel 0x38); we also
 program TTBR0/TTBR1/TCR/MAIR/SCTLR into the guest EL1 registers.
 
 ### 1.2 Handoff structs
-
-#### `sptm_bootstrap_args_xnu_t` (passed in `x2`)
 
 Size 0x340.  XNU snapshots it into a RO-late kernel global on
 entry to `arm_init`, so the buffer only needs to be valid across the call.
@@ -84,14 +108,16 @@ Zero the buffer first; set only the fields below.
 | 0x6c | 264 | random seed | the ASCII string `"randseed"` (8 B, no NUL) + 256 random bytes |
 | 0x178 | 8 | random seed length | exactly `0x108` (8 + 256) |
 | 0x180 | 1 | exclaves enabled flag | 0 - disables exclaves/SK |
-| 0x198 | 8 | XNU panic flag | VA of a 1-byte guest scratch (XNU writes `1` here on panic) |
+| 0x198 | 8 | XNU panic flag | VA of a zero-initialized 8-byte buffer; XNU writes `1` to its first byte on panic |
 | 0x1a0 | 312 | nested SPTM client state | see next section |
 | 0x2e8 | 8 | AuxKC end | top VA of the Auxiliary Kernel Collection. We ship no AuxKC, but XNU derives the overall top-of-kernelcache (its `end_kern` / `vm_kernelcache_top`) from this field, so set it to the kernelcache image end VA, 0 would break XNU's kernelcache bounds |
-| 0x318 | 8 | pmap-io-ranges table pointer | VA of the pmap-io-ranges policy table: a sorted array of 24-byte records (addr u64, size u64, flags u32, signature u32), one per protected IO range, copied from ADT `/defaults/pmap-io-ranges`. XNU's pmap consults it directly instead of re-parsing the device tree |
-| 0x320 | 4 | pmap-io-ranges count | number of 24-byte records in the table above |
-| 0x328 | 8 | pmap-io-filters table pointer | VA of the pmap-io-filters table: a sorted array of 8-byte records (signature u32, offset u16, length u16), copied from ADT `/defaults/pmap-io-filters` |
-| 0x330 | 4 | pmap-io-filters count | number of 8-byte records in the filters table |
+| 0x318 | 8 | pmap-io-ranges table pointer | guest VA of the pmap I/O range table described below |
+| 0x320 | 4 | pmap-io-ranges count | number of records in the pmap I/O range table |
+| 0x328 | 8 | pmap-io-filters table pointer | guest VA of the pmap I/O filter table described below |
+| 0x330 | 4 | pmap-io-filters count | number of records in the pmap I/O filter table |
 | 0x338 | 8 | feature flags | hardcode `0x10` (the value that boots; bit meanings not reverse-engineered) |
+
+#### 1.2.1 Debug header
 
 The debug header (0x60) is unconditionally dereferenced on the cold-boot path,
 so we allocate and zero initialize a `debug_header_t` and set:
@@ -110,12 +136,12 @@ addresses with symbols, which we don't support.
 
 Full layout information in the APSL2 licensed `sptm_xnu.h` in the KDK
 
-#### `libsptm_state` (nested at +0x1a0, 312 B)
+#### 1.2.2 `libsptm_state` (nested at +0x1a0, 312 B)
 
 | rel | abs | short description | what we put here |
 |----:|----:|-------|----------------------------|
 | 0x00 | 0x1a0 | version | `10` (the layout version this build implements; XNU selects field offsets by it) |
-| 0x08 | 0x1a8 | physical-aperture range count pointer | VA of a `u32` holding the number of physical-aperture ranges |
+| 0x08 | 0x1a8 | physical-aperture range count pointer | VA of a `u32` containing the number of records in the physical-aperture range array; `3` for our configuration |
 | 0x10 | 0x1b0 | physical-aperture range array pointer | VA of the physical-aperture range array (layout below) |
 | 0x18 | 0x1b8 | SPTM-managed RAM start | start PA of the RAM SPTM manages (physmap + frame table cover it) |
 | 0x20 | 0x1c0 | SPTM-managed RAM end | end PA of the SPTM-managed range |
@@ -126,56 +152,147 @@ Full layout information in the APSL2 licensed `sptm_xnu.h` in the KDK
 | 0x48 | 0x1e8 | frame-type params pointer | VA of the frame-type params table (256 entries; layout below) |
 | 0x50 | 0x1f0 | page-table attr table pointer | VA of the pt-attr pointer table (6 kernelcache symbol VAs; layout below) |
 | 0x58..0x78 | | cpu features, IO-range count, IO frame table, tag-storage addresses | left zero |
-| 0x80 | 0x220 | panicking-CPU-id slot pointer | VA of a u16 panicking-CPU-id slot |
-| 0x88 | 0x228 | trace buffer pointer | VA of the SPTM trace buffer |
-| 0x90 | 0x230 | per-CPU dispatch-state array | VA of the per-CPU dispatch-state array |
+| 0x80 | 0x220 | panicking-CPU-id slot pointer | VA of a writable `u16` initialized to `0xffff` |
+| 0x88 | 0x228 | trace buffer pointer | VA of a zero-initialized 16 KiB buffer |
+| 0x90 | 0x230 | per-CPU dispatch-state array | VA of a zero-initialized 16 KiB buffer; write `u32 5` at offsets `0xa30` and `0xa60` |
 | 0x98 | 0x238 | max CPU count | boot CPU count |
-| 0xa0 | 0x240 | per-CPU XNU saved-state array | VA of the per-CPU XNU saved-state array |
+| 0xa0 | 0x240 | per-CPU XNU saved-state array | VA of a zero-initialized 16 KiB buffer |
 | 0xa8 | 0x248 | feature flags | hardcode `0x8` (the value that boots; individual bit meanings not reverse-engineered) |
 | 0xb0..0xb8 | | allowed IO frame table + count | left zero |
 | 0xc0 | 0x260 | pmap-io-ranges table pointer | identical to the bootstrap args field at 1.2 (0x318) same pointer; record format defined there |
 | 0xc8 | 0x268 | pmap-io-ranges count | identical to the bootstrap args count at 1.2 (0x320) |
-| 0xd0 | 0x270 | panicking-domain-id slot pointer | VA of the panicking-domain-id slot |
-| 0xd8 | 0x278 | per-CPU event-counter array | VA of the per-CPU event-counter array |
+| 0xd0 | 0x270 | panicking-domain-id slot pointer | VA of a writable `u32` initialized to `0xff` |
+| 0xd8 | 0x278 | per-CPU event-counter array | VA of a zero-initialized 16 KiB buffer |
 | 0xe0..0x137 | | reserved padding | left zero |
+
+**Note on Duplicate Entries**: some arguments are duplicated across the
+structs: the physmap base/end (rel 0x28/0x30) and the pmap-io-ranges pointer
+and count (rel 0xc0/0xc8)
+
+The rationale is the bootstrap args are read once by early XNU boot, while this
+nested state is copied into the persistent SPTM-client globals and used for the
+kernel's lifetime. Both layers independently need the physmap window and the
+IO-range policy, so each carries its own copy.
+
+##### 1.2.2.1 Physical-aperture range array (rel 0x10; count at rel 0x08)
+
+The table libsptm uses for PA->VA (`phystokv`). Each record is 24 bytes:
+
+| off | size | field | meaning |
+|---:|---:|------|--------|
+| 0x00 | 8 | physical base | PA the window starts at |
+| 0x08 | 8 | aperture VA base | the VA where this window starts |
+| 0x10 | 4 | page count | length in 16K pages |
+| 0x14 | 4 | flags | 0 in all our entries |
+
+We emit three, in order: the ADT/devicetree window, the UAT-L2 window, then the
+SPTM-managed-RAM physmap (ADT first so its alias wins where its pages overlap
+the physmap).
 
 The three pointers at rel 0x40, 0x48, and 0x50 point to tables populated as
 follows. All tables are fully zero initialized except for the frame table
 where one field is set by default.
 
-**Frame types**: SPTM add the concept of a type for every managed frame. A
+##### 1.2.2.2 Frame types
+
+SPTM add the concept of a type for every managed frame. A
 frame's type gates how it can be used, and XNU can ask SPTM to change a page's
 type with the RETYPE endpoint (2.3.1), such as retyping a generic page to the
 page table type.
 
-| value | name | class | seeded at boot? |
-|------:|------|-------|-----------------|
-| 6 | kernel code | data (kind 5) | yes, executable kernelcache pages |
-| 11 | default rw | data (kind 5) | yes, the default fill |
-| 12 | read only | data (kind 5) | yes, RO kc pages |
-| 8 | kernel root table | table/root (kind 2) | yes, TTBR1 |
-| 18 | user root table | table/root (kind 2) | yes, TTBR0 |
-| 9 | page table | table/root (kind 2) | yes, bootstrap PTs |
-| 19 | shared root table | table/root (kind 2) | no |
-| 20 | xnu page table | table/root (kind 2) | no |
-| 21 | shared page table | table/root (kind 2) | no |
-| 22 | rozone page table | table/root (kind 2) | no |
-| 23 | commpage page table | table/root (kind 2) | no |
-| 27 | io | io (kind 5) | no |
-| 28 | protected io | io (kind 5) | no |
-| 29 | coprocessor ro io | io (kind 5) | no |
-| 33 | stage2 root table | table/root (kind 2) | no |
-| 34 | stage2 page table | table/root (kind 2) | no |
-| 40 | subpage user roots | table/root (kind 2) | no |
-| 61 | sep secure channel | data (kind 5) | yes, the SEP secure-channel page (txm.md) |
-| 0xff | invalid | -- | no |
+The table below reproduces the complete current frame-type enum. Its order and
+values come from `platform/sptm/sptm_common.h` in the KDK; the type-string table
+in the 26.6 beta 4 SPTM binary has the same order. The KDK calls values 36 and
+37 `XNU_RESERVED_1` and `XNU_RESERVED_2`; the SPTM binary names them
+`XNU_CPUTRACE_PA_BUFFER` and `XNU_CPUTRACE_VA_BUFFER`.
+
+| value | name |
+|------:|------|
+| 0 | `SPTM_UNTYPED` |
+| 1 | `SPTM_UNUSED` |
+| 2 | `SPTM_DEFAULT` |
+| 3 | `SPTM_RO` |
+| 4 | `SPTM_CODE` |
+| 5 | `SPTM_TXM_CODE` |
+| 6 | `SPTM_XNU_CODE` |
+| 7 | `SPTM_XNU_CODE_DBG_RW` |
+| 8 | `SPTM_KERNEL_ROOT_TABLE` |
+| 9 | `SPTM_PAGE_TABLE` |
+| 10 | `SPTM_IOMMU_BOOTSTRAP` |
+| 11 | `XNU_DEFAULT` |
+| 12 | `XNU_RO` |
+| 13 | `XNU_RO_DBG_RW` |
+| 14 | `XNU_USER_EXEC` |
+| 15 | `XNU_USER_DEBUG` |
+| 16 | `XNU_USER_JIT` |
+| 17 | `XNU_USER_TPRO` |
+| 18 | `XNU_USER_ROOT_TABLE` |
+| 19 | `XNU_SHARED_ROOT_TABLE` |
+| 20 | `XNU_PAGE_TABLE` |
+| 21 | `XNU_PAGE_TABLE_SHARED` |
+| 22 | `XNU_PAGE_TABLE_ROZONE` |
+| 23 | `XNU_PAGE_TABLE_COMMPAGE` |
+| 24 | `XNU_IOMMU` |
+| 25 | `XNU_ROZONE` |
+| 26 | `XNU_IO` |
+| 27 | `XNU_PROTECTED_IO` |
+| 28 | `XNU_COPROCESSOR_RO_IO` |
+| 29 | `XNU_COMMPAGE_RW` |
+| 30 | `XNU_COMMPAGE_RO` |
+| 31 | `XNU_COMMPAGE_RX` |
+| 32 | `XNU_TAG_STORAGE` |
+| 33 | `XNU_STAGE2_ROOT_TABLE` |
+| 34 | `XNU_STAGE2_PAGE_TABLE` |
+| 35 | `XNU_KERNEL_RESTRICTED` |
+| 36 | `XNU_CPUTRACE_PA_BUFFER` |
+| 37 | `XNU_CPUTRACE_VA_BUFFER` |
+| 38 | `XNU_RESTRICTED_IO` |
+| 39 | `XNU_RESTRICTED_IO_TELEMETRY` |
+| 40 | `XNU_SUBPAGE_USER_ROOT_TABLES` |
+| 41 | `TXM_DEFAULT` |
+| 42 | `TXM_RO` |
+| 43 | `TXM_RW` |
+| 44 | `TXM_CPU_STACK` |
+| 45 | `TXM_THREAD_STACK` |
+| 46 | `TXM_ADDRESS_SPACE_TABLE` |
+| 47 | `TXM_MALLOC_PAGE` |
+| 48 | `TXM_FREE_LIST` |
+| 49 | `TXM_SLAB_TRUST_CACHE` |
+| 50 | `TXM_SLAB_PROFILE` |
+| 51 | `TXM_SLAB_CODE_SIGNATURE` |
+| 52 | `TXM_SLAB_CODE_REGION` |
+| 53 | `TXM_SLAB_ADDRESS_SPACE` |
+| 54 | `TXM_BUCKET_1024` |
+| 55 | `TXM_BUCKET_2048` |
+| 56 | `TXM_BUCKET_4096` |
+| 57 | `TXM_BUCKET_8192` |
+| 58 | `TXM_BULK_DATA` |
+| 59 | `TXM_BULK_DATA_READ_ONLY` |
+| 60 | `TXM_LOG` |
+| 61 | `TXM_SEP_SECURE_CHANNEL` |
+| 62 | `SK_DEFAULT` |
+| 63 | `SK_SHARED_RO` |
+| 64 | `SK_SHARED_RW` |
+| 65 | `SK_IO` |
+
+The enum then defines `N_FRAME_TYPES=66`, `FRAME_TYPE_INVALID=67`, and
+`FRAME_TYPE_ANY=68`; these are metadata or API sentinels, not frame types.
+
+Our emulator initially fills every frame-table entry with `XNU_DEFAULT`, then
+overwrites the TTBR1 root with `SPTM_KERNEL_ROOT_TABLE`, the TTBR0 root with
+`XNU_USER_ROOT_TABLE`, bootstrap page tables with `SPTM_PAGE_TABLE`,
+executable kernelcache pages with `SPTM_XNU_CODE`, read-only kernelcache pages
+with `XNU_RO`, and the SEP secure-channel page with
+`TXM_SEP_SECURE_CHANNEL`.
 
 `kind` is a libsptm classification byte (its use is in the frame-type params,
 below). We only ever emit **2** (page-table/root) and **5** (data). Kinds 0, 1,
 3, 4 also exist but we don't use them; libsptm treats 1 as another table class,
 and 0/3/4 we haven't characterized.
 
-**Frame table** (rel 0x40) The type of each frame is recorded in the frame
+##### 1.2.2.3 Frame table (rel 0x40)
+
+The type of each frame is recorded in the frame
 table, seeded at boot, and is used to communicate type information to XNU.
 
 Every entry in the frame table is composed of a 4 byte header, which contains
@@ -237,19 +354,15 @@ XNU will retype frames as it brings them into use. For each seeded page-table
 page, set `valid_ptes` to the number of valid descriptors it holds (the
 per-page valid-entry count from building the initial tables in 1.1).
 
-Note that our emulator deivates from real SPTM behavior in a number of ways:
+Our emulator does not split roots from page tables; we use the `page_table`
+layout for every table frame, including roots. This violation is non fatal
+because it does not violate the SPTM contract. However, it is possible (and
+quite likely) that our understanding of this area is subtly incorrect both in
+how XNU works and how real SPTM works.
 
-- we do not split roots from page tables; we use the `page_table` layout for
-  every table frame, roots included.
+##### 1.2.2.4 Frame-type params (rel 0x48)
 
-- we do not maintain separate ro and wx refcounts, since XNU only cares about
-  the sum of these values to decide when to free a table
-
-These violations are non fatal because they do not violate the SPTM contract.
-However, it is possible (and quite likely) that our understanding of this area
-is subtly incorrect both in how XNU works and how real SPTM works.
-
-**Frame-type params** (rel 0x48): 256 entries of length 0x90 bytes, indexed
+256 entries of length 0x90 bytes, indexed
 by frame-type value, zeroed first. Set offset 0x01 to 2 for page-table and
 root types (8, 9, 18-23 inclusive, 33, 34, 40) and 5 for all others. XNU's
 libsptm reads this table (its pointer is handed over in `libsptm_state`) to
@@ -257,35 +370,57 @@ interpret a frame's refcount body when XNU queries a frame directly — e.g.
 `sptm_frame_is_last_mapping`, which runs inside XNU — so it must be seeded,
 not left zero.
 
-**pt-attr table** (rel 0x50): 6 pointer slots (0..5), each the kernelcache VA
+##### 1.2.2.5 pt-attr table (rel 0x50)
+
+6 pointer slots (0..5), each the kernelcache VA
 of a `_pmap_pt_attr_*` global: 0=`16k`, 1=`4k`, 2=`16k_kern`, 3=`16k_stage2`,
 4=`16k_36b_stage2`, 5=`4k_stage2`. Resolve each by its symbol name from the
 kernelcache symbol table.
 
-**Physical-aperture range array** (rel 0x10; count at rel 0x08): the table
-libsptm uses for PA->VA (`phystokv`). Each record is 24 bytes:
-
-| off | size | field | meaning |
-|---:|---:|------|--------|
-| 0x00 | 8 | physical base | PA the window starts at |
-| 0x08 | 8 | aperture VA base | the VA where this window starts |
-| 0x10 | 4 | page count | length in 16K pages |
-| 0x14 | 4 | flags | 0 in all our entries |
-
-We emit three, in order: the ADT/devicetree window, the UAT-L2 window, then the
-SPTM-managed-RAM physmap (ADT first so its alias wins where its pages overlap
-the physmap).
-
-**Note on Duplicate Entries**: some arguments are duplicated across the
-structs: the physmap base/end (rel 0x28/0x30) and the pmap-io-ranges pointer
-and count (rel 0xc0/0xc8)
-
-The rationale is the bootstrap args are read once by early XNU boot, while this
-nested state is copied into the persistent SPTM-client globals and used for the
-kernel's lifetime. Both layers independently need the physmap window and the
-IO-range policy, so each carries its own copy.
-
 Full layout information in the APSL2 licensed `sptm_common.h` in the KDK
+
+#### 1.2.3 pmap I/O policy tables
+
+These tables are constructed from `/defaults/pmap-io-ranges` and
+`/defaults/pmap-io-filters` in the ADT. They describe XNU's protected-MMIO
+policy and are separate from the physical-aperture ranges in `libsptm_state`,
+which describe PA-to-VA aliases.
+
+Each pmap I/O range is a 24-byte record:
+
+| off | size | meaning |
+|----:|-----:|---------|
+| 0x00 | 8 | physical address |
+| 0x08 | 8 | size |
+| 0x10 | 4 | flags |
+| 0x14 | 4 | signature |
+
+Require the physical address and size to be multiples of 16 KiB. The signature
+comes from the ADT range entry's four-character `name` field; interpret its
+four bytes as a big-endian `u32`. Sort the records by
+`(physical address, size, signature, flags)`, then serialize every field
+little-endian.
+
+Each pmap I/O filter is an 8-byte record:
+
+| off | size | meaning |
+|----:|-----:|---------|
+| 0x00 | 4 | signature |
+| 0x04 | 2 | offset within a 16 KiB page |
+| 0x06 | 2 | length |
+
+The signature comes from the ADT filter entry's four-character `signature`
+field and is converted in the same way as the range signature. Require
+`offset + length` to be at most 16 KiB, so a filter cannot cross a page
+boundary. Sort the records by `(signature, offset, length)`, then serialize
+every field little-endian.
+
+Place each resulting array in a separate zero-initialized allocation aligned
+to 16 KiB, with its allocation size rounded up to 16 KiB. Store the arrays'
+guest VAs and record counts at bootstrap-argument offsets 0x318 through 0x330.
+The pmap I/O range pointer and count are also copied into `libsptm_state` at
+relative offsets 0xc0 and 0xc8. The filter table is referenced only by the
+outer bootstrap arguments.
 
 ### 1.3 EL1 system registers
 
@@ -310,8 +445,8 @@ Jump to it with the following registers:
 | reg | value |
 |-----|-------|
 | `x0` | entry-routine enum (below) |
-| `x1` | PA/pointer to `boot_args` (iBoot-style; m1n1 already builds one for HV mode) |
-| `x2` | pointer to the `sptm_bootstrap_args_xnu_t` populated in 1.2 |
+| `x1` | guest VA of `boot_args` (iBoot-style; m1n1 already builds one for HV mode) |
+| `x2` | guest VA of the `sptm_bootstrap_args_xnu_t` populated in 1.2 |
 | `x3` | `0` |
 
 Entry routine: `BOOT_COLD=0` (the normal cold-boot path), `BOOT_SECONDARY=1`,
@@ -319,9 +454,10 @@ Entry routine: `BOOT_COLD=0` (the normal cold-boot path), `BOOT_SECONDARY=1`,
 
 `arm_init` immediately struct-copies `*x2` into a RO-late kernel global, so
 neither the args struct nor `libsptm_state` need to persist past the call --
-but the memory pointed at by `libsptm_state`'s PA-valued fields
-(`papt_ranges`, `root_table_paddr`'s table, `xnu_triggered_panic`, etc.)
-must remain live for the life of the boot.
+but the memory referenced by its persistent pointer fields must remain live for
+the life of the boot. These pointers, including `papt_ranges` and
+`xnu_triggered_panic`, are guest VAs. `root_table_paddr` and the managed-RAM
+bounds are physical addresses.
 
 ---
 
@@ -343,9 +479,6 @@ must remain live for the life of the boot.
 | 7 | TABLE_NOT_PRESENT | no page table at some level for the VA |
 | 8 | TABLE_ALREADY_PRESENT | table already present at the install level |
 
-libsptm utility errors are a separate enum: `LIBSPTM_SUCCESS=0`,
-`NOT_INITTED=1`, `INVALID_ARG=2`, `TYPE_MISMATCH=3`, `FAILURE=4`.
-
 This emulator only ever returns 0, 1, 5, 6, 7, 8. Values 2/3/4 and the libsptm
 utility-error enum are part of the real-SPTM definition but are never emitted
 here.
@@ -366,7 +499,6 @@ root against this record and
   root's VA span, recoverable only from this record, since overwriting TTBR0
   loses it, and falls back to a full local flush only when that span is too
   large to encode as one range op.
-It is per-CPU because TTBR0 is per-CPU.
 
 **CPU registry.** SPTM assigns each CPU a logical id at REGISTER_CPU (keyed off
 the physical MPIDR) and keeps the physical->logical map; CPU_ID returns it, and
@@ -382,19 +514,19 @@ sections after the table.
 |---:|------|----------|--------|---------|
 | 0 | LOCKDOWN | no-op (real SPTM locks CTRR / retypes text) | -- | SUCCESS |
 | 1 | RETYPE | set frame-type byte; zero page entering a PT type; record root geom/ASID for root types; TLBI on PT/IO/root | `x0`=pa, `x1`=cur type, `x2`=new type, `x3`=params (attr-idx/ASID/flags) | SUCCESS |
-| 2 | MAP_PAGE | walk to L3, install leaf PTE, refcount | `x0`=root, `x1`=va, `x2`=PTE | SUCCESS / MAP_VALID / TABLE_NOT_PRESENT / MAP_PADDR_CONFLICT; scratch=one 16-byte pair `{displaced PTE, PTE-slot aperture VA}` |
+| 2 | MAP_PAGE | walk to L3, install leaf PTE, refcount | `x0`=root, `x1`=va, `x2`=PTE, `x3`=previous-PTE output mode | SUCCESS / MAP_VALID / TABLE_NOT_PRESENT / MAP_PADDR_CONFLICT; scratch=one 16-byte pair `{displaced PTE, PTE-slot aperture VA}` |
 | 3 | MAP_TABLE | install table descriptor(s) at the parent level | `x0`=root, `x1`=va, `x2`=target level, `x3`=TTE | SUCCESS / TABLE_NOT_PRESENT / TABLE_ALREADY_PRESENT |
 | 4 | UNMAP_TABLE | clear parent TTE(s), TLBI | `x0`=root, `x1`=va, `x2`=target level | SUCCESS |
 | 5 | UPDATE_REGION | masked-merge each leaf with template[i] over N VAs | `x0`=root, `x1`=start va, `x2`=count, `x3`=templates-array ptr, `x4`=flags (0x100=defer TLBI) | SUCCESS / UPDATE_DELAYED_TLBI; scratch=8-byte displaced PTE per page, VA order (<=2048) |
 | 6 | UPDATE_DISJOINT | same merge, per op | `x1`=ops-array ptr, `x2`=count, `x3`=flags; op=`{root,va,template}` | SUCCESS / UPDATE_DELAYED_TLBI; scratch=8-byte displaced PTE per op, op order (<=2048) |
-| 7 | UNMAP_REGION | clear each leaf over N VAs, refcount-- | `x0`=root, `x1`=start va, `x2`=count | SUCCESS; scratch=8-byte displaced PTE per page, VA order |
+| 7 | UNMAP_REGION | clear each leaf over N VAs, refcount-- | `x0`=root, `x1`=start va, `x2`=count, `x3`=options | SUCCESS / UPDATE_DELAYED_TLBI; scratch=8-byte displaced PTE per page, VA order |
 | 8 | UNMAP_DISJOINT | clear each op's leaf | `x1`=ops-array ptr, `x2`=count; op=`{root,va,_}` | SUCCESS; scratch=8-byte displaced PTE per op, op order |
 | 9 | CONFIGURE_SHAREDREGION | set frame type --> shared-root-table | `x0`=pa | SUCCESS |
 | 10 | NEST_REGION | copy shared root's L2 TTEs into the user root over the range | `x0`=user root, `x1`=shared root, `x2`=start va, `x3`=page count | SUCCESS |
 | 11 | UNNEST_REGION | zero the user root's L2 TTEs over the range; TLBI | `x0`=user root, `x2`=start va, `x3`=page count | SUCCESS |
 | 12 | CONFIGURE_ROOT | no-op | -- | SUCCESS |
-| 13 | SWITCH_ROOT | kernel root --> set TTBR1; else TTBR0+ASID; TLBI | `x0`=root; `x1`/`x2`=flag set/clear masks (we ignore flags) | SUCCESS |
-| 14 | REGISTER_CPU | add phys id to the CPU registry (fuzzy match) | `x0`=phys CPU id | SUCCESS |
+| 13 | SWITCH_ROOT | select kernel-only or user address space | `x0`=root, `x1`=flags, `x2`=mask | SUCCESS |
+| 14 | REGISTER_CPU | assign a logical CPU id to a physical CPU id| `x0`=phys CPU id | SUCCESS |
 | 15 | FIXUPS_COMPLETE | no-op | -- | SUCCESS |
 | 16 | SIGN_USER_POINTER | PAC sign (key A); echo if guest key disabled | `x0`=pointer, `x1`=key, `x2`=discriminator | signed pointer (or unchanged) |
 | 17 | AUTH_USER_POINTER | PAC auth (key A) | `x0`=pointer, `x1`=key, `x2`=discriminator | authed pointer / `UINT64_MAX` on failure / unchanged |
@@ -419,10 +551,10 @@ sections after the table.
 | 38 | DISABLE_KERNEL_MODE_CPA2 | no-op | -- | SUCCESS |
 | 39 | SET_SHARED_REGION | no-op | -- | SUCCESS |
 | 40 | BATCH_SIGN_USER_POINTER | PAC sign each pointer in the ops array | `x0`=ops-array ptr, `x1`=count | SUCCESS; scratch=8-byte signed pointer per op, input order |
-| 41 | SURT_ALLOC | zero a 128-byte sub-page user root slot, record attr-index/ASID | `x0`=frame, `x1`=slot index, `x2`=attr-index, `x4`=ASID | SUCCESS |
+| 41 | SURT_ALLOC | zero a 128-byte sub-page user root slot, record attr-index/ASID | `x0`=frame, `x1`=slot index, `x2`=attr-index, `x3`=flags, `x4`=ASID | SUCCESS |
 | 42 | SURT_FREE | zero a 128-byte sub-page user root slot | `x0`=frame, `x1`=slot index | SUCCESS |
-| 43 | CONDEMN_LEAF_TABLE | walk to L2, set bit 55 of the (twig) descriptor | `x0`=root, `x1`=va | SUCCESS / TABLE_NOT_PRESENT |
-| 44 | UNCONDEMN_LEAF_TABLE | walk to L2, clear bit 55 | `x0`=root, `x1`=va | SUCCESS |
+| 43 | CONDEMN_LEAF_TABLE | walk to L2, set bit 2 of the (twig) descriptor | `x0`=root, `x1`=va | SUCCESS / TABLE_NOT_PRESENT |
+| 44 | UNCONDEMN_LEAF_TABLE | walk to L2, clear bit 2 | `x0`=root, `x1`=va | SUCCESS |
 | 45 | SPTM_SERIAL_PUTC | no-op (char dropped) | -- | SUCCESS |
 | 46 | SPTM_SERIAL_DISABLE | no-op | -- | SUCCESS |
 | 47 | *(gap)* | | | |
@@ -472,16 +604,23 @@ to be extended to UAT) that ensures that no cachable accesses to NC pages.
 
 #### 2.3.2 MAP_PAGE (endpoint 2)
 
-MAP_PAGE installs one leaf (L3) PTE. `x0`=root, `x1`=va, `x2`=PTE. It walks to
-the L3 table for va and writes the leaf. It increments two refcounts (the
-target frame's mapping refcount and the L3 table's `valid_ptes`), then writes a
-16-byte {displaced PTE, PTE-slot aperture VA} pair to the per-CPU scratch (args
-0x00) so XNU sees what it overwrote.
+MAP_PAGE installs one leaf PTE. `x0`=root, `x1`=va, `x2`=PTE, and `x3`
+selects whether the previous mapping is returned. It walks to the L3 table for
+the VA and writes the leaf.
 
-No L3 table for va --> TABLE_NOT_PRESENT. If a valid mapping is already there,
-re-mapping the same PA upgrades it in place (MAP_VALID); a different PA is
-refused with MAP_PADDR_CONFLICT, so XNU must unmap the old page and retry. A
-fresh map --> SUCCESS. It flushes (TLBI) only when it replaced a valid mapping.
+For a fresh mapping, increment the target frame's mapping refcount and the L3
+table's `valid_ptes`. Updating an existing mapping of the same physical page
+does not change either refcount.
+
+If `x3` is zero, write a 16-byte `{previous PTE, PTE-slot aperture VA}` pair to
+the invoking CPU's scratch page. If `x3` is one, do not write this result. Our
+emulator ignores `x3` and always writes the pair.
+
+No L3 table for the VA returns TABLE_NOT_PRESENT. Re-mapping the same physical
+page updates the PTE in place and returns MAP_VALID. Attempting to replace it
+with a different physical page returns MAP_PADDR_CONFLICT without changing the
+PTE, so XNU must unmap the old page and retry. A fresh mapping returns SUCCESS.
+Invalidate the old translation after updating an existing valid mapping.
 
 #### 2.3.3 Leaf attribute updates (endpoints 5, 6, 21)
 
@@ -554,25 +693,38 @@ fix keeps a page's alias consistent when its memory type changes.
 
 #### 2.3.4 UNMAP_{REGION, DISJOINT} (endpoints 7, 8)
 
-These endpoints clear each leaf PTE to 0, decrementing both refcounts (1.2),
-and write each old PTE to the scratch (8 bytes per leaf, in order). REGION = a
-consecutive run (`x0`=root, `x1`=start va, `x2`=count); DISJOINT = a {root, va, _} op
-array (`x1`=ptr, `x2`=count, template slot unused). Both endpoints flush TLB.
+These endpoints set each selected leaf PTE to zero. For every valid mapping
+removed, decrement the mapped frame's mapping refcount and the leaf table's
+`valid_ptes`. Write each previous PTE to the invoking CPU's scratch page, eight
+bytes per requested leaf and in request order.
+
+UNMAP_REGION (7) operates on a consecutive run. `x0`=root, `x1`=start VA,
+`x2`=count, and `x3`=options. If option bit 8 (`0x100`) is zero, invalidate the
+affected translations and return SUCCESS. If it is set, leave the invalidation
+to XNU and return UPDATE_DELAYED_TLBI when at least one valid mapping was
+removed.
+
+UNMAP_DISJOINT (8) takes an array of `{root, VA, unused}` operations in `x1`
+and the operation count in `x2`. It invalidates the affected translations and
+returns SUCCESS.
 
 #### 2.3.5 {MAP, UNMAP}_TABLE (endpoints 3, 4)
 
 These endpoints link and unlink page-table pages in the tree, called after
-RETYPE to add or remove page tables from the tree. Neither modifies a refcount
-or `valid_ptes`.
+RETYPE to add or remove page tables from the tree. Linking increments the child
+frame's `parent_links`; unlinking decrements it. Neither operation changes the
+child table's `valid_ptes`.
 
 MAP_TABLE (3): install a table descriptor at the requested level. `x0`=root,
 `x1`=va, `x2`=target level, `x3`=TTE (carries the child PA). It walks to that level:
 no path to it --> TABLE_NOT_PRESENT; a table already linked at
 that slot --> TABLE_ALREADY_PRESENT (it won't overwrite a live link); otherwise
-it writes the descriptor and returns SUCCESS. For a 4K root, four 4K page
-tables share one 16K frame, so MAP_TABLE links the whole frame at once: it
-rounds the parent index down to a multiple of 4 and writes four consecutive
-descriptors, the n-th pointing to the n-th 4K sub-table (child + n*4K).
+it writes the descriptor and returns SUCCESS.
+
+For a 4K root, four 4K page tables share one 16K frame, so MAP_TABLE links the
+whole frame at once: it rounds the parent index down to a multiple of 4 and
+writes four consecutive descriptors, the n-th pointing to the n-th 4K sub-table
+(child + n*4K). `parent_links` is only updated once.
 
 UNMAP_TABLE (4): clear the table descriptor at the target level, TLBI, return
 SUCCESS.  `x0`=root, `x1`=va, `x2`=target level. A missing table is an immediate
@@ -591,34 +743,48 @@ UNNEST_REGION (11): undo a nest. `x0`=user root, `x2`=start va, `x3`=page count
 (`x1` unused). For each L2 block it zeroes the user root's L2 slot, dropping the
 link to the shared L2 tables (which are left intact). TLBI, SUCCESS.
 
-SWITCH_ROOT (13): install a page-table root. `x0`=root. If it is the kernel root
-(kernel_root_table type) set the guest's TTBR1 (via its EL12 alias) to the root
-PA, with no ASID. Otherwise it is a user root: set TTBR0 to the root PA tagged
-with the root's ASID, looked up from the size/ASID recorded for it at
-RETYPE/SURT time (2.3.1). SPTM normally reads `x1`/`x2` and determines if it can
-skip the TLB flush, or do a narrowly scoped flush, but our emulator does a
-full flush every call.
+SWITCH_ROOT (13): select the page-table root for the invoking CPU. `x0`=root.
+There are two cases depending on what's inside `x0`:
+
+If it is a kernel root (kernel_root_table type) set an empty (valid root that
+contains no mappings) TTBR0 (via its EL12 alias), with no ASID.  The kernel
+root would have been installed earlier in bootstrap.  
+
+Otherwise, it is a user root. set TTBR0 to the root PA tagged with the root's
+ASID, looked up from the size/ASID recorded for it at RETYPE/SURT time (2.3.1).
+SPTM normally reads `x1=flags`/`x2=mask` to configure other things: JIT, JOP,
+x86_64 compatability, TPRO, and how to flush.
+
+Our emulator has a slightly different behavior. If it is a kernel root, then we
+unconditionally install it to TTBR1 and don't touch TTBR0. We also
+unconditionally emit a `tlbi`.
 
 #### 2.3.7 SURT_{ALLOC, FREE} (endpoints 41, 42)
 
-A sub-page user root packs several roots into one frame as 128-byte slots.
-`x0`=frame, `x1`=slot index, `x2`=attr-index (geometry) from pt-attr table,
-`x4`=ASID (`x3` unused by the emulator, meaning not yet reverse engineered). The
-slot is at frame + index*128. Both endpoints zero the 128-byte slot. SURT_ALLOC
-(41) additionally writes the slot's geometry + ASID into the same per-root
-record RETYPE keeps for roots (2.3.1), so SWITCH_ROOT can later find this root's
-ASID. SURT_FREE (42) just zeroes. Both return SUCCESS.
+These endpoint packs several user roots into one frame as 128-byte slots. The
+first 64 bytes of this slot are an ordinary ARM root page table containing eight
+descriptors.  The second 64 bytes of this slot are internal SPTM bookkeeping
+that is not reverse engineered, but it contains the ASID and geometry.
+
+`x0`=frame, `x1`=slot index, for both. SURT_ALLOC also has `x2`=attr-index
+(geometry) from pt-attr table, `x3`=flags currently unused in emulator,
+`x4`=ASID. The slot is at frame + index * 128. In our emulator (real SPTM
+diverges) we just zero the full 128 byte slot first.
+
+SURT_ALLOC (41): allocate a sub page user root. Other endpoints actually
+populate it. Record the geometry and the ASID (later used by SWITCH_ROOT).
+
+SURT_FREE (42) just frees internal resources and zeros the slot.
 
 #### 2.3.8 REGISTER_CPU and CPU_ID (endpoints 14, 19)
 
-REGISTER_CPU (14):  Every CPU, when it spins up, calls REGISTER_CPU to be
+REGISTER_CPU (14): Every CPU, when it spins up, calls REGISTER_CPU to be
 assigned an arbitrary logical ID used to identify which per cpu scratch page it
 will use (slot = base + 16K * id; args 0x00 in 1.2). The boot CPU always gets
-zero; the secondaries 1...5 are assigned arbitrarily in order of spinup.
-`x0`=lower 32 bits of MPIDR.  We check to see if we've seen a CPU before using a
-fuzzy MPIDR compare (exact, then low 32 / 24 / 16 bits, to tolerate
-affinity-field differences). Update SPTM internal state with the new
-logical ID.
+zero; the secondaries are assigned sequentially in order of spinup. `x0`=lower
+32 bits of MPIDR. Update SPTM internal state with the new logical ID. Real
+SPTM additionally checks that `x0` is actually one of the CPUs present in the
+ADT.
 
-CPU_ID (19): `x0`=physical CPU id. Returns the logical id for that phys id, via
-the same fuzzy match against internal state, or 0 if it is not registered.
+CPU_ID (19): `x0`=physical CPU id. Returns the logical id for that phys id,
+panic if unregistered.

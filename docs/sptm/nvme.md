@@ -1,13 +1,13 @@
 # NVMe SPTM Dispatch
 
 This document is written against m1n1 commit
-`07ad22a1e1897070a167080289f8365529f15e86` on 2026-07-03.
+`f5f8d2c7027d4ae37e4db27ea33720fe98151445` on 2026-07-27.
 
 Real SPTM does significant validation on all requests; we do our best to
 document it here, even though most if not all is required for a functioning
 emulator. However, we know that it is not complete.
 
-- **Table 6** `NVME` — endpoints 0..8 (9)
+- **Table 6** `NVME`, endpoints 0..8 (9)
 
 Related but separate: **Table 5** `SART` (the ANS DMA address-allowlist)
 
@@ -36,13 +36,17 @@ and `/chosen/carveout-memory-map`.
   the defaults property and `nvme-secure-bar` are both present and
   `nvme-secure-reg-layout` is absent, SPTM uses `reg[9]` as the BAR aperture
   for the same logical queue-register writes.
-- `nvme-queue-entries`: seeds the queue entry count. This also bounds valid
-  CIDs and sizes the SPTM-owned queue/TCB/PRP scratch state. m1n1 currently 
-  uses a fixed queue size
-- `nvme-linear-sq`: seeds the linear submission queue mode. SPTM uses this for
-  queue-protocol validation and TCB/queue backing layout.
-- `/chosen/carveout-memory-map/region-id-55`: seeds the trusted NVMe I/O
-  range used when validating queue, TCB, and PRP pages.
+- `nvme-queue-entries`: seeds the queue entry count, so valid CIDs are `0`
+  through `queue_entries - 1`. SPTM sizes each TCB span as
+  `round_up(queue_entries * 0x80, 0x1000)` and allocates
+  `round_up(queue_entries * 0x800, 0x4000)` bytes of PRP-list backing,
+  providing one `0x800`-byte slot per CID. m1n1 currently uses a fixed queue
+  size.
+- `nvme-linear-sq`: seeds the linear submission queue mode. Endpoints 1 and 3
+  use this for queue-protocol validation and TCB/queue backing layout.
+- `/chosen/carveout-memory-map/region-id-55`: identifies a physical-memory
+  region that SPTM's security model additionally permits as backing for certain
+  NVMe/ANS objects.
 - `nvme-prp-flush-wa`: enables the PRP-list cache flush workaround; see
   endpoints 1 and 2.
 
@@ -55,21 +59,19 @@ endpoints:
 - `nvme-ans-sha-present` and `reg[14]`: seed ANS SHA support and the ANS SHA
   register aperture.
 
-SPTM also allocates and records its own admin queue backing, TCB backing, and
-per-CID PRP-list scratch from the seeded queue count. Those buffers are not ADT
-properties.
+SPTM also allocates and records its own TCB backing and per-CID PRP-list
+scratch from the seeded queue count. Those buffers are not ADT properties.
 
 ### 1.1 Internal State
 
 SPTM keeps one NVMe state object. Boot handoff seeds the selected BAR/NVMMU
 apertures, optional TL/VDMA/ANS-SHA sideband apertures, queue count, linear-SQ
 mode, secure/packed BAR mode, workaround flags, endpoint allow state, and the
-trusted NVMe I/O range.
+range specified by `region-id-55`.
 
-SPTM also owns memory that XNU does not directly manage: CoastGuard/admin queue
-backing, live TCB backing for queue 0 and queue 1, and per-CID page that
-contains the PRP list when a command needs more PRP entries than directly
-fit in PRP1/PRP2.
+SPTM also owns memory that XNU does not directly manage: TCB backing for
+queues 0 and 1 and one contiguous PRP-list buffer divided into a 0x800-byte
+slot for each CID.
 
 Queue-register endpoints cache the values they accept, including admin queue
 registers, IO queue registers, and ANS-SHA state. Later calls must match the
@@ -109,12 +111,12 @@ phase, uses the CoastGuard queue backing allocated during boot handoff, and
 advances the endpoint-order state so XNU can continue queue setup or
 per-command mapping.
 
-The hardware-visible part is small. SPTM writes the physical addresses of its
-CoastGuard queue backing to the CoastGuard queue-base registers, writes the
-CoastGuard enable value, and issues a barrier. Using the NVMMU aperture seeded
-as `reg[3] + 0x28000`, the writes are `base + 0x108`, `base + 0x110`, and
-`base + 0x100`. m1n1 already knows the corresponding ANS/NVMMU registers as
-the TCB queue-base area.
+The hardware-visible operations use the NVMMU register layout already
+implemented in `src/nvme.c`. Write the physical address of the first
+boot-allocated TCB span to `NVMMU_ASQ_BASE` and the second to
+`NVMMU_IOSQ_BASE`, then write `0x3f` to `NVMMU_NUM`. SPTM performs each 64-bit
+base write as low/high 32-bit writes and issues `dsb sy` after every MMIO
+write.
 
 ### 2.2 Map and Unmap Pages (endpoints 1, 2)
 
@@ -150,34 +152,46 @@ using values from the validated list, and then written to the live TCB slot.
 Per CID state is recorded for unmap later.
 
 For one or two requested pages, SPTM writes the validated addresses directly
-into TCB PRP1 and PRP2. For more than two pages, SPTM writes the first address
-to PRP1, writes the address of an SPTM-owned PRP-list page to PRP2, and fills
-that page with the remaining segment-list entries.
+into TCB PRP1 and PRP2. For more than two pages, it writes the first address to
+PRP1, writes the physical address of the CID's `0x800`-byte PRP-list slot to
+PRP2, and fills that slot with the remaining addresses. The slot address is
+`prp_list_base + cid * 0x800`.
 
-The primary difference compared to m1n1 is that SPTM merely validates TCB
-templates supplied by XNU rather than building new ones itself. It is very
-likely that an emulator can just pass XNU built TCBs directly to hardware.
+The primary difference compared to m1n1 is that SPTM merely validates (via the
+above rebuild process) TCB templates supplied by XNU. It is likely that an
+emulator can just pass XNU built TCBs directly to hardware.
+
+The TCB backing selected by endpoint 1 depends on `nvme-linear-sq`. When the
+property is present, boot allocates two TCB spans, one for each queue, and
+endpoint 1 writes into those spans. When it is absent, boot allocates four
+spans and endpoint 1 writes into the later pair. Endpoint 0 always programs the
+physical addresses of the first pair into the NVMMU. Each span has the size
+specified in Section 1.
 
 Endpoint 2 validates the recorded CID state, invalidates and clears the live
 TCB slot, releases the recorded PRP pages by decrementing the refcounts that
 were previously incremented, clears scratch state, and frees the CID.
 
-If `nvme-prp-flush-wa` was seeded from ADT, PRP-list metadata written by SPTM
-requires explicit cache maintenance before ANS consumes it. After endpoint 1
-fills a per-CID PRP-list area with more than 16 segment entries, it performs a
-barrier and clean+invalidate over the populated PRP-list range, rounded up to a
-128-byte boundary; for `count >= 0x100`, it cleans a full `0x1000` bytes.
-Endpoint 2 performs the matching workaround cleanup for maximum-size lists
-during teardown.
+If `nvme-prp-flush-wa` was seeded from ADT and `count > 0x10`, endpoint 1
+issues `dsb sy` and clean+invalidates the PRP-list slot. For `count < 0x100`,
+the length is `(count * 8 + 0x7f) & 0x1f80`; otherwise it is `0x1000`.
+
+During endpoint 2, if the recorded count is greater than `0xff`, SPTM issues
+`dsb sy` and clean+invalidates `0x800` bytes starting at
+`prp_list_slot + 0x800`.
 
 Endpoint 2 has the unusual normal return convention: successful teardown
 returns `x0 = 1`; if the `nvme-tl-wa` sideband status wait times out, endpoint
 2 returns `x0 = 0` so XNU can retry the teardown later. Other invalid arguments
 or impossible CID state are fatal SPTM violations.
 
-Endpoint 2's normal NVMMU invalidation uses registers m1n1 already knows: write
-the CID to the TCB invalidate register and check the corresponding status. The
-ADT-seeded workaround sidebands are separate. 
+Endpoint 2 writes the CID to m1n1's `NVMMU_TCB_INVAL` register and issues
+`dsb sy`. It then reads the packed 32-bit status table beginning at the NVMMU
+base. The first word contains the statuses for CIDs 0-3, and each following
+word covers the next four CIDs. Within each word, the four status fields begin
+at bits 0, 5, 10, and 15. The low four bits of the selected field must be zero.
+This packed status table is not implemented by m1n1. The ADT-seeded workaround
+sidebands are separate.
 
 If `nvme-vdma-wa` is present, an additional check is performed.
 Endpoint 2 reads `reg[13] + 0x20000 + cid * 0x20` and requires bits `0x300` be
@@ -212,8 +226,11 @@ SPTM polls repeatedly for up to approximately .25ms, if TL is still not idle
 then it marks the CID for retry and returns 0 so XNU can retry later without
 rearming the mask or control registers for the command.
 
-If retry is set, skip the TCB clear, VDMA check, NVMMU invalidate, and the
-writes to the mask/control registers (already handled by the previous call).
+If `retry` is set, SPTM skips the TCB clear, VDMA check, NVMMU invalidation,
+and the initial direction-specific writes to the mask and control registers.
+It resumes transaction-layer polling using the recorded completed-slot state.
+Once all slots are done, it still writes `0x800080` to both mask registers and
+`0x400040` to the control register before completing teardown.
 
 ### 2.3 Validate Queue Entries (endpoint 3)
 
@@ -227,22 +244,13 @@ and SPTM agree on the queue layout that later endpoints will use.
 
 ### 2.4 Program Queues and Apertures (endpoints 4-8)
 
-These endpoints program the NVME registers; real SPTM performs significant
-validation on the values but the actual hardware visible effects are minimal.
-All writes below go through the BAR aperture selected in §1 (endpoint 8 uses
-`reg[14]`), each followed by a barrier.
+Endpoints 4 through 7 perform the queue-register writes already implemented
+by m1n1, using the BAR aperture selected in Section 1. SPTM issues `dsb sy`
+after each 32-bit MMIO write.
 
-- **Endpoint 4**: writes `AQA` = admin queue sizes (`asq_size |
-  acq_size << 16`) to BAR + `0x24`, `ASQ` = admin SQ base PA to BAR + `0x28`,
-  and `ACQ` = admin CQ base PA to BAR + `0x30`. m1n1 knows these as
-  `NVME_AQA` / `NVME_ASQ` / `NVME_ACQ`.
-- **Endpoint 5**: writes the IO queue sizes (`iosq_size | iocq_size << 16`) to
-  BAR + `0x1210`.
-- **Endpoint 6**: writes the IO submission queue base PA to BAR + `0x1200`.
-- **Endpoint 7**: writes the IO completion queue base PA to BAR + `0x1208`.
-- **Endpoint 8**: only if `nvme-ans-sha-present`; writes the SHA buffer page
-  number (`sha_pa >> 14`) to `reg[14] + 0x0` and the 2-bit packed-write config
-  to `reg[14] + 0x4`.
+Endpoint 8 is available only when `nvme-ans-sha-present` is present. It writes
+the SHA buffer page number (`sha_pa >> 14`) to `reg[14] + 0x0` and the 2-bit
+packed-write configuration to `reg[14] + 0x4`.
 
 SPTM internal checks consist of validation and caching of the arguments, along
 with the allowed-function gating. Generally the checks are: each address is
