@@ -10,6 +10,11 @@ This document covers the SART SPTM dispatch tables
 The overall behavior of SART is already understood in m1n1; this document
 bridges the existing understanding to the sptm implementation.
 
+Exception: SPTM in T6050 (and presumably T6051) supports SARTv4, which is not
+yet currently understood in m1n1. It is identical to SARTv3, except it has
+the extra throttle register (below) and has 24 slots instead of 16, with the
+paddr and size values moved over to support the extra slots.
+
 ## 1. Boot Handoff
 
 Before XNU boots, seed the SART emulator from `/arm-io/sart-ans`: `reg[0]`,

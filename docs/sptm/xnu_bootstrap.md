@@ -755,9 +755,12 @@ ASID, looked up from the size/ASID recorded for it at RETYPE/SURT time (2.3.1).
 SPTM normally reads `x1=flags`/`x2=mask` to configure other things: JIT, JOP,
 x86_64 compatability, TPRO, and how to flush.
 
-Our emulator has a slightly different behavior. If it is a kernel root, then we
-unconditionally install it to TTBR1 and don't touch TTBR0. We also
-unconditionally emit a `tlbi`.
+The bring-up emulator installs a dedicated pinned empty root in TTBR0 for the
+kernel-root case and leaves the already-live TTBR1 alone. It still
+unconditionally emits a `tlbi`. An earlier implementation incorrectly rewrote
+TTBR1 and left the prior user TTBR0 live; after XNU freed and reused that root,
+a CPU could walk ordinary data as a page table and generate a late LLC/AMCC
+fabric error.
 
 #### 2.3.7 SURT_{ALLOC, FREE} (endpoints 41, 42)
 

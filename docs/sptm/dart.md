@@ -46,12 +46,20 @@ node with `compatible = dart,t8110` and a `dart-id`.
     the range is the allowed page-table carveout for that SID.
 - `flush-by-dva`: seed the leaf-change flush policy. If present, map/unmap
     changes use DVA-range flushes instead of broader SID flushes.
-- `avoid-tlbi-in-map`: seed the map-side TLBI policy. If present, endpoint 2
-    may skip the TLBI for fresh leaf installs, but still flushes when replacing
-    an existing valid leaf.
+- `avoid-tlbi-in-map`: records the native map-side TLBI policy. The bring-up
+  emulator currently uses the conservative path and invalidates the SID for
+  every changed leaf. It cannot safely skip invalid-to-valid updates until
+  XNU's complete batched-map/drain contract is modeled; otherwise a cached
+  negative translation can survive a fresh mapping.
 - `relaxed-rw-protections`: seed DART permission-policy state. Current
-    emulation records it but does not apply the full real-SPTM
-    frame-type-dependent permission policy.
+  emulation records it but does not apply the full real-SPTM
+  frame-type-dependent permission policy.
+- `protection-granularity`: identifies newer DARTs whose exact subpage-field
+  scaling is not yet recovered. Older nodes default to 4 bytes; T8142 APCIe
+  declares 128 bytes and USB declares 16 bytes. For bring-up, the emulator
+  deliberately disables subpage enforcement on these coarse-granularity
+  instances by emitting the hardware-proven full-page range `0..0xfff`; PA and
+  read/write permission bits remain unchanged.
 - `piogw-ps-protection`: seed PIOGW power-state protection descriptors for
     DARTs with PIOGW `instance` entries.
 

@@ -148,7 +148,7 @@ dereferences it.
 | 49 | Image4SetNonce | `NOT_PERMITTED` | yes | Deliberately refused. |
 | 50 | Image4RollNonce | `NOT_PERMITTED` | yes | Deliberately refused. |
 | 51 | Image4GetNonce | `NOT_PERMITTED` | yes | Deliberately refused. |
-| other | unsupported selector | `NOT_SUPPORTED` | yes | |
+| other | unsupported selector | `NOT_SUPPORTED` | not called | |
 
 ## 5. Selector 2: GetCodeSigningInfo
 
