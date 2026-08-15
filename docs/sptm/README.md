@@ -31,15 +31,18 @@ Together, the completed documents cover the T8140 SPTM tables needed by the
 current macOS 26.6 beta 4 boot path. Start with the XNU bootstrap document,
 then use the subsystem-specific documents for each runtime dispatch table.
 
-## Emulators
+The Exclave document differs as it documents the full Exclave lifecycle, rather
+than being just another dispatch table.
+
+## Index
 
 - [xnu_bootstrap.md](xnu_bootstrap.md) — XNU_BOOTSTRAP table (page-table / frame-table) and the boot handoff
 - [dart.md](dart.md) — DART IOMMU
 - [nvme.md](nvme.md) — NVMe
 - [uat.md](uat.md) — GPU UAT and T8140 SAPT
 - [sart.md](sart.md) — SART
+- [exclaves.md](exclaves.md) - Exclaves and Ringgate
 - [txm.md](txm.md) — minimal TXM/XNU compatibility shim
-
 
 ## SPTM overview
 
