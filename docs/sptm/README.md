@@ -6,6 +6,8 @@ These docs were written based on extensive disassembly of the SPTM binary as
 found on the MacBook Neo (T8140) on firmware version 26.6 beta 4, as well
 as the 26.5 KDK.
 
+Parts have been updated for 27.0 Beta 3 2 for the MacBook Air M5.
+
 ## Scope
 
 These documents are not a 1:1 description of what SPTM does. We make a best

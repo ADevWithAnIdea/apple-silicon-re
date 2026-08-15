@@ -1,5 +1,8 @@
 # XNU Bootstrap -- Clean-Room Functional Specification (DRAFT)
 
+This document is written against m1n1 commit
+`844ffc7232ec3ee21ece59eab2d70e3cc443fe8e` on 2026-07-31.
+
 This document covers the boot handoff and the XNU_BOOTSTRAP table (domain 0,
 table 0).
 
@@ -154,16 +157,21 @@ Full layout information in the APSL2 licensed `sptm_xnu.h` in the KDK
 | 0x58..0x78 | | cpu features, IO-range count, IO frame table, tag-storage addresses | left zero |
 | 0x80 | 0x220 | panicking-CPU-id slot pointer | VA of a writable `u16` initialized to `0xffff` |
 | 0x88 | 0x228 | trace buffer pointer | VA of a zero-initialized 16 KiB buffer |
-| 0x90 | 0x230 | per-CPU dispatch-state array | VA of a zero-initialized 16 KiB buffer; write `u32 5` at offsets `0xa30` and `0xa60` |
+| 0x90 | 0x230 | per-CPU dispatch-state array | an array of unique pointers, all pointing to the number 5 |
 | 0x98 | 0x238 | max CPU count | boot CPU count |
-| 0xa0 | 0x240 | per-CPU XNU saved-state array | VA of a zero-initialized 16 KiB buffer |
+| 0xa0 | 0x240 | per-CPU saved-state array | an array of pointers pointing to zero-initialized 16 KiB buffers |
 | 0xa8 | 0x248 | feature flags | hardcode `0x8` (the value that boots; individual bit meanings not reverse-engineered) |
 | 0xb0..0xb8 | | allowed IO frame table + count | left zero |
 | 0xc0 | 0x260 | pmap-io-ranges table pointer | identical to the bootstrap args field at 1.2 (0x318) same pointer; record format defined there |
 | 0xc8 | 0x268 | pmap-io-ranges count | identical to the bootstrap args count at 1.2 (0x320) |
 | 0xd0 | 0x270 | panicking-domain-id slot pointer | VA of a writable `u32` initialized to `0xff` |
-| 0xd8 | 0x278 | per-CPU event-counter array | VA of a zero-initialized 16 KiB buffer |
+| 0xd8 | 0x278 | per-CPU event-counter array | same as per-CPU saved-state array |
 | 0xe0..0x137 | | reserved padding | left zero |
+
+Internally, SPTM allocates one `0x1800` byte object per CPU and then the
+pointers in the dispatch-state array, saved-state array, and event-counter
+array all point to different offsets into these objects, `0x000`, `0x050`, and
+`0xc90` respectively. Most of these fields are never read by XNU.
 
 **Note on Duplicate Entries**: some arguments are duplicated across the
 structs: the physmap base/end (rel 0x28/0x30) and the pmap-io-ranges pointer
@@ -318,6 +326,10 @@ struct frame_entry {
             u32 ro_refcount; // read by XNU: ro+wx summed is the total mapping
             u32 wx_refcount; // count, freed when count = 0
         } cpu_page;
+        struct {             // XNU_TAG_STORAGE
+            u32 tag_storage_count;
+            u8  _rsvd8[8];
+        } tag_storage;
         struct {             // page table (non-root)
             u8  level;
             u8  _rsvd5;
@@ -530,7 +542,7 @@ sections after the table.
 | 15 | FIXUPS_COMPLETE | no-op | -- | SUCCESS |
 | 16 | SIGN_USER_POINTER | PAC sign (key A); echo if guest key disabled | `x0`=pointer, `x1`=key, `x2`=discriminator | signed pointer (or unchanged) |
 | 17 | AUTH_USER_POINTER | PAC auth (key A) | `x0`=pointer, `x1`=key, `x2`=discriminator | authed pointer / `UINT64_MAX` on failure / unchanged |
-| 18 | REGISTER_EXC_RETURN | no-op | -- | SUCCESS |
+| 18 | REGISTER_EXC_RETURN | no-op without Exclaves; with Exclaves, saves the return trampoline | `x0`=va of XNU's exception return trampoline | SUCCESS |
 | 19 | CPU_ID | look up the logical CPU id for a phys id | `x0`=phys CPU id | logical id |
 | 20 | SLIDE_REGION | no-op | -- | SUCCESS |
 | 21 | UPDATE_DISJOINT_MULTIPAGE | per-page header + inner ops, masked-merge | `x0`=ops-array ptr, `x1`=count; entry=`{paddr, papt template, inner N, opts}` | SUCCESS / UPDATE_DELAYED_TLBI; scratch=8-byte displaced PTE per inner op |
@@ -597,10 +609,8 @@ used to individually flush every page.
 Exactly what these instructions do is unknown and cannot be easily reverse
 engineered because we do not have the ability to actually run the instructions.
 We know they involve coprocessor cache visibility, but the exact behavior is
-not known.  Experiments have shown that a simple `tlbi` is insufficient to
+not known. Experiments have shown that a simple `tlbi` is insufficient to
 replicate their behavior, even when combined with various `dsb` variants.
-Instead, we implement a mitigation: special handling in DART (that likely needs
-to be extended to UAT) that ensures that no cachable accesses to NC pages.
 
 #### 2.3.2 MAP_PAGE (endpoint 2)
 
@@ -791,3 +801,116 @@ ADT.
 
 CPU_ID (19): `x0`=physical CPU id. Returns the logical id for that phys id,
 panic if unregistered.
+
+---
+
+## 3. Updates in macOS 27
+
+For macOS 27, use the handoff structure below and add the endpoint behavior in
+3.3. The page-table operations described above are otherwise unchanged.
+
+### 3.1 XNU handoff structure
+
+The T8142 structure is 0x368 bytes. Zero it before filling the fields below.
+All pointers are XNU kernel virtual addresses unless the field explicitly says
+PA or PAPT.
+
+| off | size | field | required value |
+|----:|-----:|-------|----------------|
+| 0x000 | 8 | version | `0xd00f000000000000` |
+| 0x008 | 8 | physmap base | first VA in XNU's physical aperture |
+| 0x010 | 8 | physmap end | exclusive end VA of the physical aperture |
+| 0x018 | 8 | first available PA | first page available to XNU; after SK bootstrap this is the final cursor returned by cL4 |
+| 0x020 | 8 | physical-slide PAPT | start of the range XNU may release, or zero when unused |
+| 0x028 | 8 | physical-slide size | size of that range, or zero |
+| 0x030 | 8 | TXM thread-stack array | VA of the array of TXM thread-stack PAPT addresses |
+| 0x038 | 4 | TXM thread-stack count | number of entries in the array |
+| 0x040 | 8 | per-CPU stack window start | inclusive PAPT bound |
+| 0x048 | 8 | per-CPU stack window end | exclusive PAPT bound |
+| 0x050 | 8 | executables window start | inclusive kernel executable VA bound |
+| 0x058 | 8 | executables window end | exclusive kernel executable VA bound |
+| 0x060 | 8 | debug header | VA of the debug header described in 1.2.1 |
+| 0x068 | 4 | ASID count | maximum virtual ASID count |
+| 0x06c | 264 | random seed | `"randseed"` followed by 256 random bytes |
+| 0x178 | 8 | random seed length | `0x108` |
+| 0x180 | 1 | SK bootstrapped | `1` after successful cL4 bootstrap |
+| 0x188 | 8 | SK carveout size | final cL4 cursor minus its initial allocation cursor |
+| 0x190 | 4 | SPTM variant | `0` for release, `1` for development |
+| 0x198 | 8 | XNU panic flag | VA of the persistent zero-initialized flag |
+| 0x1a0 | 312 | `libsptm_state` | version-12 state described in 3.2 |
+| 0x2d8 | 4 | tag-storage frame count | number of MTE tag-storage frames, dram size >> 19 |
+| 0x2e0 | 8 | first tag-storage PA | `S3_0_C11_C9_0 & 0x3fffff00000` |
+| 0x2e8 | 8 | AuxKC base | AuxKC PAPT base, or zero |
+| 0x2f0 | 8 | AuxKC Mach-O | AuxKC Mach-O PAPT, or zero |
+| 0x2f8 | 8 | AuxKC end | exclusive AuxKC PAPT bound; use the kernelcache end when no AuxKC is present |
+| 0x300 | 8 | SK bootstrap timestamp | may be zero |
+| 0x308 | 8 | XNU bootstrap timestamp | may be zero |
+| 0x310 | 8 | TXM bootstrap timestamp | may be zero |
+| 0x318 | 8 | SPTM initialization timestamp | may be zero |
+| 0x320 | 8 | SK completion timestamp | may be zero |
+| 0x328 | 8 | TXM completion timestamp | may be zero |
+| 0x330 | 8 | reserved/hibernation metadata | zero for cold boot |
+| 0x338 | 8 | hibernation scratch-page PA | zero for cold boot |
+| 0x340 | 8 | pmap I/O ranges | PAPT pointer to the parsed range table |
+| 0x348 | 4 | pmap I/O range count | number of range records |
+| 0x350 | 8 | pmap I/O filters | PAPT pointer to the parsed filter table |
+| 0x358 | 4 | pmap I/O filter count | number of filter records |
+| 0x360 | 8 | SPTM feature flags | feature mask supplied to XNU |
+
+Reserve the MTE range and initialize its frame-table entries as
+`XNU_TAG_STORAGE` (type 32), so XNU cannot allocate it as ordinary memory.
+
+The old `sptm_prev_ptes` pointer was removed. XNU obtains each CPU's output
+area through endpoint 50 instead.
+
+### 3.2 `libsptm_state` version 12
+
+`libsptm_state` remains 0x138 bytes. Its version is `12`. The fields through
+the per-CPU event-counter pointer at relative offset 0xd8 retain the layout in
+1.2.2, however some previously reserved offsets are now used and some fields
+have had their values changed:
+
+| rel | size | field | required value |
+|----:|-----:|-------|----------------|
+| 0x000 | 4 | version | `12` (previously 10) |
+| 0x070 | 8 | first tag-storage PA | same address as the outer handoff field at 0x2e0 |
+| 0x078 | 8 | tag-storage end PA | first tag-storage PA plus the outer tag-storage frame count times 16 KiB |
+| 0x0a8 | 8 | feature flags | `0x89`: MTE (`1 << 0`), the existing baseline feature (`1 << 3`), and SAPT (`1 << 7`) (previously 0x10) |
+
+It also had more items appended to the end of the struct:
+
+| rel | size | field | required value |
+|----:|-----:|-------|----------------|
+| 0x0e0 | 8 | DRAM base PA | first PA covered by SAPT |
+| 0x0e8 | 8 | DRAM end PA | exclusive end PA covered by SAPT |
+| 0x0f0 | 8 | SAPT table PAPT | PAPT VA of the SAPT range |
+| 0x0f8 | 8 | version string | persistent VA of any NUL-terminated string |
+| 0x100 | 8 | reserved | zero on physical systems |
+| 0x108 | 48 | reserved | zero |
+
+### 3.3 New XNU_BOOTSTRAP endpoints
+
+macOS 27 adds the following domain-0, table-0 endpoints:
+jj
+| id | name | behavior | inputs | outputs |
+|---:|------|----------|--------|---------|
+| 35 | TAG_PAPT_MULTIPAGE | Set each data frame's tagged-PAPT state, change its PAPT leaf to MTE AttrIndx 4, increment `tag_storage_count` of the backing tag-storage frame, and invalidate the affected translations | `x0`=PA of an array of page PAs, `x1`=count (`1..64`), `x2`=options (`0x100` defers the TLBI) | `SUCCESS`, or `UPDATE_DELAYED_TLBI` when the TLBI is deferred |
+| 36 | UNTAG_PAPT_MULTIPAGE | Clear each data frame's tagged-PAPT state, restore PAPT AttrIndx 0, decrement `tag_storage_count`, and invalidate the affected translations | same | `SUCCESS` |
+| 50 | OUTPUT_AREA | Return the PAPT VA of the CPU's 16 KiB output area; XNU caches it during CPU initialization | `x0`=SPTM logical CPU ID | output-area PAPT VA |
+
+Endpoint 18, `REGISTER_EXC_RETURN`, is also required when SK is enabled. It
+takes XNU's exception-return trampoline VA in `x0` and retains it for exception
+delivery; treating this endpoint as a no-op prevents interrupted RingGate calls
+from resuming.
+
+### 3.4 Other required ABI updates
+
+- `UPDATE_DISJOINT` accepts option `0x400` (`ASYNC_TLBI`): update the PTE and
+  issue the TLBI without the trailing synchronization. It applies only to
+  generic XNU pages and only to endpoint 6.
+- `SIGN_USER_POINTER` and `AUTH_USER_POINTER` take an additional saved JOP key
+  in `x4`. `BATCH_SIGN_USER_POINTER` takes it in `x3`.
+- A sub-page user root is 1024 bytes containing 128 TTEs. A 16 KiB frame has
+  15 usable roots; the final 1024-byte slot is reserved for metadata.
+- Frame type 39 is `XNU_RESTRICTED_IO_RO`; the later frame-type values move up
+  by one. Frame type 67 is the new `SK_XNU_CONTENT` type.
