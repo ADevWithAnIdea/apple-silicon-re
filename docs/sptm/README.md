@@ -27,9 +27,11 @@ Every component of the SPTM emulator has two parts:
 
 2. endpoint emulation
 
-Together, the completed documents cover the T8140 SPTM tables needed by the
-current macOS 26.6 beta 4 boot path. Start with the XNU bootstrap document,
-then use the subsystem-specific documents for each runtime dispatch table.
+Together, the completed documents primarily cover the T8140 SPTM tables needed
+by the current macOS 26.6 boot path. Start with the XNU bootstrap document,
+then use the subsystem-specific documents for each runtime dispatch table. We
+additionally describe the updates required for 27.0 support and Exclaves on
+T8142.
 
 The Exclave document differs as it documents the full Exclave lifecycle, rather
 than being just another dispatch table.
@@ -41,7 +43,7 @@ than being just another dispatch table.
 - [nvme.md](nvme.md) — NVMe
 - [uat.md](uat.md) — GPU UAT and T8140 SAPT
 - [sart.md](sart.md) — SART
-- [exclaves.md](exclaves.md) - Exclaves and Ringgate
+- [exclaves.md](exclaves.md) - Exclaves and RingGate
 - [txm.md](txm.md) — minimal TXM/XNU compatibility shim
 
 ## SPTM overview
@@ -67,8 +69,8 @@ Dispatch flow: on every HVC trap the EL2 handler:
 
 1. Reads `ESR_EL2.ISS` (the `genter` immediate).  We only handle `ISS=0` as
    the rest do not occur during regular operation.
-2. Reads `x16`. Rejects if any reserved bit is set, or `domain > 4`, or
-   `table > 11`.
+2. Reads `x16`. Rejects if any reserved bit is set, or any unsupported
+   domain/table is called.
 3. Retrieve domain, table, and endpoint.  Args remain in `x0..xN`.
 4. Resolves `x16` to an endpoint via three nested lookups: `domain` picks
    the component (0=SPTM, 2=TXM, 3=SK, each owns its own table namespace);
@@ -89,8 +91,7 @@ Dispatch flow: on every HVC trap the EL2 handler:
 | 6 | DOMAINS_NONE (sentinel) |
 | 255 | NO_PANICKING_DOMAIN |
 
-Only domain 0 (SPTM) and domain 2 (TXM) are brought up in our emulator; domain
-3 (SK) is not since we currently do not support exclaves. Domains 1 (XNU), 4
+We bring up domains 0 (SPTM), 2 (TXM), and 3 (exclaves). Domains 1 (XNU), 4
 (XNU_HIB), 6 (DOMAINS_NONE), and 255 (NO_PANICKING_DOMAIN) are unused.
 
 ### Tables
@@ -102,9 +103,9 @@ owns these:
 |----:|-------|-------|
 | 0 | XNU_BOOTSTRAP | the table containing all the page table management operations -- see [xnu_bootstrap.md](xnu_bootstrap.md) |
 | 1 | TXM_BOOTSTRAP | unused |
-| 2 | SK_BOOTSTRAP | unused |
+| 2 | SK_BOOTSTRAP | manages the exclave lifecycle -- see [exclaves.md](exclaves.md) |
 | 3 | T8110_DART_XNU | see [dart.md](dart.md) |
-| 4 | T8110_DART_SK | unused |
+| 4 | T8110_DART_SK | see [exclaves.md](exclaves.md) |
 | 5 | SART | see [sart.md](sart.md) |
 | 6 | NVME | see [nvme.md](nvme.md) |
 | 7 | UAT | see [uat.md](uat.md) |
@@ -112,22 +113,19 @@ owns these:
 | 9 | RESERVED | unused |
 | 10 | HIB | unused |
 | 11 | GEN3_DART_XNU | not present on T8140 |
-| 12 | GEN3_DART_SK | not present on T8140 |
+| 12 | GEN3_DART_SK | tested only on T8142; currently uses the same SK-DART handlers as table 4 in our emulator |
 | 13 | T6000_DART_XNU | unused |
 | 14 | INVALID | unused |
-| 0xFD | RETURN_TO_CALLER | unused |
-| 0xFE | PANIC | unused |
-| 0xFF | EXCEPTION_STATE_SAVED | unused |
+| 0xFD | RETURN_TO_CALLER | used for Exclaves on 26.6, 27.0 changed the dispatch method -- see [exclaves.md](exclaves.md) |
+| 0xFE | PANIC | used for Exclaves on 26.6, 27.0 changed the dispatch method -- see [exclaves.md](exclaves.md) |
+| 0xFF | EXCEPTION_STATE_SAVED | used for Exclaves on 26.6, 27.0 changed the dispatch method -- see [exclaves.md](exclaves.md) |
 
 TXM (domain 2) only has a single table, see [txm.md](txm.md)
 
+SK (domain 3) only has a single table, see [exclaves.md](exclaves.md)
+
 Every file contains details of both the pre xnu handoff and the runtime
 endpoint emulation.
-
-## Future Work
-
-Work is ongoing to support Exclaves. When this work is complete, this
-documentation will be updated with the new information.
 
 ## Legal
 
