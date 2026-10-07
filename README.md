@@ -5,8 +5,9 @@ Everything here is clean room, nothing tainted
 ## Directory
 
 ```
+├── agx-re: submodule containing G16/G17 AGX experiments, purely LLM written
 ├── docs: documentation *for humans* to read
-├── gpu: submodule containing G16/G17 AGX experiments, purely LLM written
+├── llm_docs: a collection of LLM written docs, not auditted for completeness, correctness, or readability by humans
 └── README.md: this file
 ```
 
